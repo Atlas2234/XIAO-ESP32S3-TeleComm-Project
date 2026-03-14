@@ -1,53 +1,60 @@
-/* Edge Impulse Arduino examples
- * Copyright (c) 2022 EdgeImpulse Inc.
+/* Motion-Triggered Keyword Detection for XIAO ESP32S3 Sense
+ * 
+ * Combines camera-based motion detection with Edge Impulse audio keyword inference.
+ * When motion is detected, the microphone begins listening for keywords.
+ * After a period of no motion, inference stops to save power.
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Based on Edge Impulse Arduino examples (MIT License)
  */
 
 // If your target is limited in memory remove this macro to save 10K RAM
 #define EIDSP_QUANTIZE_FILTERBANK   0
 
-/*
- ** NOTE: If you run into TFLite arena allocation issue.
- **
- ** This may be due to may dynamic memory fragmentation.
- ** Try defining "-DEI_CLASSIFIER_ALLOCATION_STATIC" in boards.local.txt (create
- ** if it doesn't exist) and copy this file to
- ** `<ARDUINO_CORE_INSTALL_PATH>/arduino/hardware/<mbed_core>/<core_version>/`.
- **
- ** See
- ** (https://support.arduino.cc/hc/en-us/articles/360012076960-Where-are-the-installed-cores-located-)
- ** to find where Arduino installs cores on your machine.
- **
- ** If the problem persists then there's not enough memory for this model and application.
- */
-
-/* Includes ---------------------------------------------------------------- */
+/* ========================== INCLUDES ========================== */
 #include <XIAOESP32S3_Telecomm_Project_inferencing.h>
-
 #include <I2S.h>
-#define SAMPLE_RATE 16000U
-#define SAMPLE_BITS 16
+#include "esp_camera.h"
 
-#define LED_BUILT_IN 21 
+/* ========================== CAMERA PIN DEFINITIONS ========================== */
+#define CAMERA_PIN_PWDN  -1
+#define CAMERA_PIN_RESET -1
+#define CAMERA_PIN_XCLK  10
+#define CAMERA_PIN_SIOD  40
+#define CAMERA_PIN_SIOC  39
+#define CAMERA_PIN_D7    48
+#define CAMERA_PIN_D6    11
+#define CAMERA_PIN_D5    12
+#define CAMERA_PIN_D4    14
+#define CAMERA_PIN_D3    16
+#define CAMERA_PIN_D2    18
+#define CAMERA_PIN_D1    17
+#define CAMERA_PIN_D0    15
+#define CAMERA_PIN_VSYNC 38
+#define CAMERA_PIN_HREF  47
+#define CAMERA_PIN_PCLK  13
 
-/** Audio buffers, pointers and selectors */
+/* ========================== CONFIGURATION ========================== */
+// Audio
+#define SAMPLE_RATE     16000U
+#define SAMPLE_BITS     16
+
+// LED
+#define LED_BUILT_IN    21
+
+// Motion detection tuning
+#define BLOCK_SIZE          8
+#define PIXEL_THRESHOLD     30    // per-pixel brightness change to count as "different"
+#define MOTION_THRESHOLD    15.0  // percentage of blocks that must change to trigger motion
+
+// How long (ms) to keep listening after the last motion event
+#define MOTION_COOLDOWN_MS  10000
+
+// How often (ms) to check for motion
+#define MOTION_CHECK_INTERVAL_MS 500
+
+/* ========================== GLOBALS ========================== */
+
+// --- Audio inference ---
 typedef struct {
     int16_t *buffer;
     uint8_t buf_ready;
@@ -58,30 +65,253 @@ typedef struct {
 static inference_t inference;
 static const uint32_t sample_buffer_size = 2048;
 static signed short sampleBuffer[sample_buffer_size];
-static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
-static bool record_status = true;
+static bool debug_nn = false;
+static volatile bool record_status = false;
+static TaskHandle_t captureTaskHandle = NULL;
 
-/**
- * @brief      Arduino setup function
- */
-void setup()
-{
-    // put your setup code here, to run once:
+// --- Motion detection ---
+static uint8_t *prev_frame = NULL;
+static size_t prev_frame_len = 0;
+static bool motion_active = false;           // true while we're in "listening" mode
+static unsigned long last_motion_time = 0;   // timestamp of last motion event
+static unsigned long last_motion_check = 0;  // timestamp of last motion check
+
+// --- State machine ---
+enum SystemState {
+    STATE_WATCHING,    // camera checking for motion, mic off
+    STATE_LISTENING    // motion detected, mic on, running inference
+};
+static SystemState currentState = STATE_WATCHING;
+
+/* ========================== CAMERA FUNCTIONS ========================== */
+
+bool init_camera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer   = LEDC_TIMER_0;
+    config.pin_d0       = CAMERA_PIN_D0;
+    config.pin_d1       = CAMERA_PIN_D1;
+    config.pin_d2       = CAMERA_PIN_D2;
+    config.pin_d3       = CAMERA_PIN_D3;
+    config.pin_d4       = CAMERA_PIN_D4;
+    config.pin_d5       = CAMERA_PIN_D5;
+    config.pin_d6       = CAMERA_PIN_D6;
+    config.pin_d7       = CAMERA_PIN_D7;
+    config.pin_xclk     = CAMERA_PIN_XCLK;
+    config.pin_pclk     = CAMERA_PIN_PCLK;
+    config.pin_vsync    = CAMERA_PIN_VSYNC;
+    config.pin_href     = CAMERA_PIN_HREF;
+    config.pin_sccb_sda = CAMERA_PIN_SIOD;
+    config.pin_sccb_scl = CAMERA_PIN_SIOC;
+    config.pin_pwdn     = CAMERA_PIN_PWDN;
+    config.pin_reset    = CAMERA_PIN_RESET;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_GRAYSCALE;
+    config.frame_size   = FRAMESIZE_QQVGA;  // 160x120
+    config.fb_count     = 2;
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed: 0x%x\n", err);
+        return false;
+    }
+    Serial.println("Camera initialized.");
+    return true;
+}
+
+bool check_motion() {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        return false;
+    }
+
+    bool motion_detected = false;
+
+    if (prev_frame != NULL && prev_frame_len == fb->len) {
+        int changedBlocks = 0;
+        int totalBlocks = (fb->width / BLOCK_SIZE) * (fb->height / BLOCK_SIZE);
+
+        for (size_t y = 0; y < fb->height; y += BLOCK_SIZE) {
+            for (size_t x = 0; x < fb->width; x += BLOCK_SIZE) {
+                int blockDiff = 0;
+                int blockPixels = 0;
+
+                for (size_t by = 0; by < BLOCK_SIZE && (y + by) < fb->height; by++) {
+                    for (size_t bx = 0; bx < BLOCK_SIZE && (x + bx) < fb->width; bx++) {
+                        size_t idx = (y + by) * fb->width + (x + bx);
+                        int diff = abs((int)fb->buf[idx] - (int)prev_frame[idx]);
+                        if (diff > PIXEL_THRESHOLD) blockDiff++;
+                        blockPixels++;
+                    }
+                }
+
+                if (blockDiff > blockPixels / 2) changedBlocks++;
+            }
+        }
+
+        float percentChanged = (float)changedBlocks / totalBlocks * 100.0;
+        if (percentChanged > MOTION_THRESHOLD) {
+            Serial.printf("Motion detected! (%.1f%% blocks changed)\n", percentChanged);
+            motion_detected = true;
+        }
+    }
+
+    // Store current frame as previous
+    if (prev_frame == NULL) {
+        prev_frame = (uint8_t *)malloc(fb->len);
+    }
+    if (prev_frame) {
+        memcpy(prev_frame, fb->buf, fb->len);
+        prev_frame_len = fb->len;
+    }
+
+    esp_camera_fb_return(fb);
+    return motion_detected;
+}
+
+/* ========================== AUDIO INFERENCE FUNCTIONS ========================== */
+
+static void audio_inference_callback(uint32_t n_bytes) {
+    for (int i = 0; i < n_bytes >> 1; i++) {
+        inference.buffer[inference.buf_count++] = sampleBuffer[i];
+
+        if (inference.buf_count >= inference.n_samples) {
+            inference.buf_count = 0;
+            inference.buf_ready = 1;
+        }
+    }
+}
+
+static void capture_samples(void* arg) {
+    const int32_t i2s_bytes_to_read = (uint32_t)arg;
+    size_t bytes_read = i2s_bytes_to_read;
+
+    while (record_status) {
+        esp_i2s::i2s_read(esp_i2s::I2S_NUM_0, (void*)sampleBuffer, i2s_bytes_to_read, &bytes_read, 100);
+
+        if (bytes_read <= 0) {
+            ei_printf("Error in I2S read : %d", bytes_read);
+        } else {
+            if (bytes_read < i2s_bytes_to_read) {
+                ei_printf("Partial I2S read");
+            }
+
+            // Scale the data (otherwise the sound is too quiet)
+            for (int x = 0; x < i2s_bytes_to_read / 2; x++) {
+                sampleBuffer[x] = (int16_t)(sampleBuffer[x]) * 8;
+            }
+
+            if (record_status) {
+                audio_inference_callback(i2s_bytes_to_read);
+            } else {
+                break;
+            }
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+static bool microphone_inference_start(uint32_t n_samples) {
+    inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
+    if (inference.buffer == NULL) {
+        return false;
+    }
+
+    inference.buf_count = 0;
+    inference.n_samples = n_samples;
+    inference.buf_ready = 0;
+
+    ei_sleep(100);
+
+    record_status = true;
+
+    xTaskCreate(capture_samples, "CaptureSamples", 1024 * 32, (void*)sample_buffer_size, 10, &captureTaskHandle);
+
+    return true;
+}
+
+static void microphone_inference_stop() {
+    record_status = false;
+    // Give the task time to exit cleanly
+    delay(200);
+    captureTaskHandle = NULL;
+
+    if (inference.buffer != NULL) {
+        free(inference.buffer);
+        inference.buffer = NULL;
+    }
+    inference.buf_ready = 0;
+    inference.buf_count = 0;
+}
+
+static bool microphone_inference_record(void) {
+    // Non-blocking check with timeout so we can also monitor motion
+    unsigned long start = millis();
+    while (inference.buf_ready == 0) {
+        delay(10);
+        // Timeout after 2 seconds to allow motion check cycle
+        if (millis() - start > 2000) {
+            return false;
+        }
+    }
+    inference.buf_ready = 0;
+    return true;
+}
+
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr) {
+    numpy::int16_to_float(&inference.buffer[offset], out_ptr, length);
+    return 0;
+}
+
+/* ========================== STATE TRANSITIONS ========================== */
+
+void enter_listening_state() {
+    Serial.println(">>> Entering LISTENING state — starting keyword detection...");
+    currentState = STATE_LISTENING;
+    last_motion_time = millis();
+
+    if (!microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT)) {
+        ei_printf("ERR: Could not allocate audio buffer (size %d)\r\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT);
+        currentState = STATE_WATCHING;  // Fall back
+        return;
+    }
+
+    ei_printf("Microphone recording started.\n");
+}
+
+void enter_watching_state() {
+    Serial.println(">>> Entering WATCHING state — stopping keyword detection...");
+    microphone_inference_stop();
+    currentState = STATE_WATCHING;
+    digitalWrite(LED_BUILT_IN, HIGH);  // LED off
+}
+
+/* ========================== SETUP ========================== */
+
+void setup() {
     Serial.begin(115200);
-    // comment out the below line to cancel the wait for USB connection (needed for native USB)
     while (!Serial);
-    Serial.println("Edge Impulse Inferencing Demo");
+    Serial.println("=== Motion-Triggered Keyword Detection ===");
 
-    pinMode(LED_BUILT_IN, OUTPUT); // Set the pin as output
-    digitalWrite(LED_BUILT_IN, HIGH); //Turn off
-    
+    // LED setup
+    pinMode(LED_BUILT_IN, OUTPUT);
+    digitalWrite(LED_BUILT_IN, HIGH);  // Off
+
+    // Initialize camera
+    if (!init_camera()) {
+        Serial.println("FATAL: Camera init failed. Halting.");
+        while (1);
+    }
+
+    // Initialize I2S microphone
     I2S.setAllPins(-1, 42, 41, -1, -1);
     if (!I2S.begin(PDM_MONO_MODE, SAMPLE_RATE, SAMPLE_BITS)) {
-      Serial.println("Failed to initialize I2S!");
-    while (1) ;
-  }
-    
-    // summary of inferencing settings (from model_metadata.h)
+        Serial.println("FATAL: I2S init failed. Halting.");
+        while (1);
+    }
+
+    // Print Edge Impulse model info
     ei_printf("Inferencing settings:\n");
     ei_printf("\tInterval: ");
     ei_printf_float((float)EI_CLASSIFIER_INTERVAL_MS);
@@ -90,186 +320,98 @@ void setup()
     ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
     ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
 
-    ei_printf("\nStarting continious inference in 2 seconds...\n");
-    ei_sleep(2000);
-
-    if (microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT) == false) {
-        ei_printf("ERR: Could not allocate audio buffer (size %d), this could be due to the window length of your model\r\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT);
-        return;
-    }
-
-    ei_printf("Recording...\n");
+    Serial.println("\nSystem ready. Watching for motion...\n");
 }
 
-/**
- * @brief      Arduino main function. Runs the inferencing loop.
- */
-void loop()
-{
-    bool m = microphone_inference_record();
-    if (!m) {
-        ei_printf("ERR: Failed to record audio...\n");
-        return;
-    }
+/* ========================== MAIN LOOP ========================== */
 
-    signal_t signal;
-    signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
-    signal.get_data = &microphone_audio_signal_get_data;
-    ei_impulse_result_t result = { 0 };
+void loop() {
+    unsigned long now = millis();
 
-    EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
-    if (r != EI_IMPULSE_OK) {
-        ei_printf("ERR: Failed to run classifier (%d)\n", r);
-        return;
-    }
+    switch (currentState) {
 
-    int pred_index = 0;     // Initialize pred_index
-    float pred_value = 0;   // Initialize pred_value
+    // ---- STATE: WATCHING (camera active, mic off) ----
+    case STATE_WATCHING:
+        if (now - last_motion_check >= MOTION_CHECK_INTERVAL_MS) {
+            last_motion_check = now;
 
-    // print the predictions
-    ei_printf("Predictions ");
-    ei_printf("(DSP: %d ms., Classification: %d ms., Anomaly: %d ms.)",
-        result.timing.dsp, result.timing.classification, result.timing.anomaly);
-    ei_printf(": \n");
-    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
-        ei_printf("    %s: ", result.classification[ix].label);
-        ei_printf_float(result.classification[ix].value);
-        ei_printf("\n");
-
-        if (result.classification[ix].value > pred_value){
-           pred_index = ix;
-           pred_value = result.classification[ix].value;
-      }
-    }
-    // Display inference result
-    if (pred_index == 1){
-      digitalWrite(LED_BUILT_IN, LOW); //Turn on
-    }
-    else{
-      digitalWrite(LED_BUILT_IN, HIGH); //Turn off
-    }
-
-    
-#if EI_CLASSIFIER_HAS_ANOMALY == 1
-    ei_printf("    anomaly score: ");
-    ei_printf_float(result.anomaly);
-    ei_printf("\n");
-#endif
-}
-
-static void audio_inference_callback(uint32_t n_bytes)
-{
-    for(int i = 0; i < n_bytes>>1; i++) {
-        inference.buffer[inference.buf_count++] = sampleBuffer[i];
-
-        if(inference.buf_count >= inference.n_samples) {
-          inference.buf_count = 0;
-          inference.buf_ready = 1;
+            if (check_motion()) {
+                enter_listening_state();
+            }
         }
-    }
-}
+        break;
 
-static void capture_samples(void* arg) {
+    // ---- STATE: LISTENING (mic active, running inference) ----
+    case STATE_LISTENING:
+        // Periodically check for continued motion to reset cooldown
+        if (now - last_motion_check >= MOTION_CHECK_INTERVAL_MS) {
+            last_motion_check = now;
 
-  const int32_t i2s_bytes_to_read = (uint32_t)arg;
-  size_t bytes_read = i2s_bytes_to_read;
-
-  while (record_status) {
-
-    /* read data at once from i2s - Modified for XIAO ESP2S3 Sense and I2S.h library */
-    // i2s_read((i2s_port_t)1, (void*)sampleBuffer, i2s_bytes_to_read, &bytes_read, 100);
-    esp_i2s::i2s_read(esp_i2s::I2S_NUM_0, (void*)sampleBuffer, i2s_bytes_to_read, &bytes_read, 100);
-
-    if (bytes_read <= 0) {
-      ei_printf("Error in I2S read : %d", bytes_read);
-    }
-    else {
-        if (bytes_read < i2s_bytes_to_read) {
-        ei_printf("Partial I2S read");
+            if (check_motion()) {
+                last_motion_time = now;  // Reset cooldown timer
+            }
         }
 
-        // scale the data (otherwise the sound is too quiet)
-        for (int x = 0; x < i2s_bytes_to_read/2; x++) {
-            sampleBuffer[x] = (int16_t)(sampleBuffer[x]) * 8;
-        }
-
-        if (record_status) {
-            audio_inference_callback(i2s_bytes_to_read);
-        }
-        else {
+        // Check if cooldown expired — no motion for a while
+        if (now - last_motion_time > MOTION_COOLDOWN_MS) {
+            enter_watching_state();
             break;
         }
+
+        // Run one inference cycle
+        {
+            bool m = microphone_inference_record();
+            if (!m) {
+                // Timed out waiting for audio — that's OK, just loop back
+                break;
+            }
+
+            signal_t signal;
+            signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+            signal.get_data = &microphone_audio_signal_get_data;
+            ei_impulse_result_t result = { 0 };
+
+            EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
+            if (r != EI_IMPULSE_OK) {
+                ei_printf("ERR: Failed to run classifier (%d)\n", r);
+                break;
+            }
+
+            // Find the best prediction
+            int pred_index = 0;
+            float pred_value = 0;
+
+            ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
+                result.timing.dsp, result.timing.classification, result.timing.anomaly);
+
+            for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+                ei_printf("    %s: ", result.classification[ix].label);
+                ei_printf_float(result.classification[ix].value);
+                ei_printf("\n");
+
+                if (result.classification[ix].value > pred_value) {
+                    pred_index = ix;
+                    pred_value = result.classification[ix].value;
+                }
+            }
+
+            // Act on keyword detection (index 1 = your target keyword)
+            if (pred_index == 1) {
+                Serial.println("*** KEYWORD DETECTED! ***");
+                digitalWrite(LED_BUILT_IN, LOW);  // LED on
+                enter_watching_state();
+            } else {
+                digitalWrite(LED_BUILT_IN, HIGH);  // LED off
+            }
+
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+            ei_printf("    anomaly score: ");
+            ei_printf_float(result.anomaly);
+            ei_printf("\n");
+#endif
+        }
+        break;
     }
-  }
-  vTaskDelete(NULL);
-}
-
-/**
- * @brief      Init inferencing struct and setup/start PDM
- *
- * @param[in]  n_samples  The n samples
- *
- * @return     { description_of_the_return_value }
- */
-static bool microphone_inference_start(uint32_t n_samples)
-{
-    inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
-
-    if(inference.buffer == NULL) {
-        return false;
-    }
-
-    inference.buf_count  = 0;
-    inference.n_samples  = n_samples;
-    inference.buf_ready  = 0;
-
-//    if (i2s_init(EI_CLASSIFIER_FREQUENCY)) {
-//        ei_printf("Failed to start I2S!");
-//    }
-
-    ei_sleep(100);
-
-    record_status = true;
-
-    xTaskCreate(capture_samples, "CaptureSamples", 1024 * 32, (void*)sample_buffer_size, 10, NULL);
-
-    return true;
-}
-
-/**
- * @brief      Wait on new data
- *
- * @return     True when finished
- */
-static bool microphone_inference_record(void)
-{
-    bool ret = true;
-
-    while (inference.buf_ready == 0) {
-        delay(10);
-    }
-
-    inference.buf_ready = 0;
-    return ret;
-}
-
-/**
- * Get raw audio signal data
- */
-static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr)
-{
-    numpy::int16_to_float(&inference.buffer[offset], out_ptr, length);
-
-    return 0;
-}
-
-/**
- * @brief      Stop PDM and release buffers
- */
-static void microphone_inference_end(void)
-{
-    free(sampleBuffer);
-    ei_free(inference.buffer);
 }
 
 #if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_MICROPHONE
